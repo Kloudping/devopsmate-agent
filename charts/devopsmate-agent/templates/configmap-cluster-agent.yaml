@@ -1,0 +1,84 @@
+{{- if .Values.clusterAgent.enabled -}}
+{{- $prof := include "devopsmate-agent.profile" . | fromJson -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "devopsmate-agent.fullname" . }}-cluster
+  namespace: {{ include "devopsmate-agent.namespace" . }}
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    receivers:
+      {{- if .Values.clusterAgent.collectClusterMetrics }}
+      k8s_cluster:
+        collection_interval: {{ $prof.interval }}
+        node_conditions_to_report: [Ready, MemoryPressure, DiskPressure]
+        allocatable_types_to_report: [cpu, memory, pods]
+      {{- end }}
+      {{- if .Values.clusterAgent.collectEvents }}
+      k8sobjects:
+        objects:
+          - name: events
+            mode: watch
+            group: ""
+      {{- end }}
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_mib: {{ $prof.memLimitMib }}
+        spike_limit_mib: {{ $prof.spikeMib }}
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+      resource:
+        attributes:
+          - { key: service.namespace, action: upsert, value: devopsmate }
+          - { key: devopsmate.tenant_id, action: upsert, value: "${env:DEVOPSMATE_TENANT_ID}" }
+          - { key: tenant_id, action: upsert, value: "${env:DEVOPSMATE_TENANT_ID}" }
+          - { key: env, action: upsert, value: "${env:OTEL_ENVIRONMENT}" }
+          {{- if .Values.global.clusterName }}
+          - { key: k8s.cluster.name, action: upsert, value: {{ .Values.global.clusterName | quote }} }
+          {{- end }}
+          - { key: collector.type, action: upsert, value: agent-cluster }
+
+    exporters:
+      otlp/gateway:
+        endpoint: "${env:DEVOPSMATE_GATEWAY_ENDPOINT}"
+        auth:
+          authenticator: bearertokenauth/gateway
+        tls:
+          insecure: ${env:DEVOPSMATE_OTLP_INSECURE}
+          insecure_skip_verify: ${env:DEVOPSMATE_TLS_SKIP_VERIFY}
+        compression: zstd
+        sending_queue: { enabled: true, num_consumers: 2, queue_size: 5000 }
+        retry_on_failure: { enabled: true, initial_interval: 5s, max_interval: 30s, max_elapsed_time: 300s }
+        timeout: 30s
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+        path: /health
+      bearertokenauth/gateway:
+        token: ${env:DEVOPSMATE_API_KEY}
+
+    service:
+      extensions: [health_check, bearertokenauth/gateway]
+      telemetry:
+        logs: { level: info }
+        metrics: { level: normal, address: 0.0.0.0:8888 }
+      pipelines:
+        {{- if .Values.clusterAgent.collectClusterMetrics }}
+        metrics:
+          receivers: [k8s_cluster]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlp/gateway]
+        {{- end }}
+        {{- if .Values.clusterAgent.collectEvents }}
+        logs:
+          receivers: [k8sobjects]
+          processors: [memory_limiter, resource, batch]
+          exporters: [otlp/gateway]
+        {{- end }}
+{{- end }}

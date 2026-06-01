@@ -1,0 +1,82 @@
+# ── DevopsMate OpenTelemetry Agent — values ───────────────────────────────────
+# Quick start:
+#   helm upgrade --install devopsmate-agent devopsmate/devopsmate-agent \
+#     -n devopsmate --create-namespace \
+#     --set global.tenantId=<TENANT> --set global.env=production \
+#     --set gateway.endpoint=<GATEWAY_HOST:4317> --set apiKey.value=<AGENT_TOKEN>
+
+# Footprint profile: minimal | standard | full.
+# Lightweight comes from fewer/cheaper signals + capped CPU/mem (GOMAXPROCS/GOMEMLIMIT),
+# NOT from slow intervals — intervals stay short so monitoring is real-time.
+profile: standard
+
+global:
+  tenantId: ""              # DEVOPSMATE_TENANT_ID resource attribute (required)
+  env: "production"         # OTEL_ENVIRONMENT — drives gateway routing
+  clusterName: ""           # optional k8s.cluster.name attribute
+
+gateway:
+  endpoint: ""              # OTLP gRPC host:port of the DevopsMate gateway (required)
+  tls:
+    insecure: false         # set true only for an internal not-yet-TLS gateway (auth still enforced)
+    insecureSkipVerify: false
+    caCertSecret: ""        # optional Secret holding ca.crt to trust a private CA
+
+# Shared agent ingest token (must equal the gateway's DEVOPSMATE_AGENT_TOKEN).
+apiKey:
+  value: ""                 # chart creates a Secret when set
+  existingSecret: ""        # OR reference a pre-created Secret (keeps the key out of `helm` args)
+  existingSecretKey: "api-key"
+
+# Signal toggles
+metrics: { enabled: true }
+logs:    { enabled: true }
+traces:  { enabled: true }
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+  tag: ""                   # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# Per-node agent: host metrics, kubelet/pod metrics, container logs, app OTLP.
+nodeAgent:
+  enabled: true
+  filelog:
+    enabled: true
+  collectKubeSystem: false  # skip kube-system logs by default (noise + cost)
+  # resources/GOMAXPROCS/GOMEMLIMIT default from `profile` (see _helpers.tpl) but are overridable here.
+  resources: {}
+  tolerations:
+    - operator: Exists      # run on every node, incl. tainted/control-plane
+  nodeSelector: {}
+  affinity: {}
+
+# Single cluster-wide collector: k8s events + cluster metrics (one watcher, not per-node).
+clusterAgent:
+  enabled: true
+  replicas: 1
+  collectEvents: true
+  collectClusterMetrics: true
+  resources: {}
+
+# eBPF zero-code traces (Grafana Beyla). On by default; bounded by resources + openPorts.
+beyla:
+  enabled: true
+  image:
+    repository: grafana/beyla
+    tag: "1.9.6"
+    pullPolicy: IfNotPresent
+  openPorts: "80,443,3000,5000,8000,8080,8443,9000,9090"  # only instrument these (don't trace everything)
+  privileged: true          # eBPF; set false to use scoped CAP_BPF/CAP_PERFMON/CAP_SYS_ADMIN (kernel >=5.8)
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+
+serviceAccount:
+  create: true
+  name: ""                  # defaults to the release fullname
+
+rbac:
+  create: true
+
+namespaceOverride: ""

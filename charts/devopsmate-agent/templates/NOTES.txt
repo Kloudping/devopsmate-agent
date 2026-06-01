@@ -1,0 +1,31 @@
+DevopsMate OpenTelemetry Agent installed — release "{{ .Release.Name }}" in namespace "{{ include "devopsmate-agent.namespace" . }}".
+
+Profile: {{ .Values.profile }} (footprint/intervals)
+Signals: metrics={{ .Values.metrics.enabled }} logs={{ .Values.logs.enabled }} traces={{ .Values.traces.enabled }} eBPF(Beyla)={{ .Values.beyla.enabled }}
+
+{{- if not .Values.global.tenantId }}
+
+⚠  global.tenantId is empty — set it so telemetry is attributed to your tenant:
+     --set global.tenantId=<YOUR_TENANT_ID>
+{{- end }}
+{{- if not .Values.gateway.endpoint }}
+
+⚠  gateway.endpoint is empty — set it to your DevopsMate gateway OTLP endpoint:
+     --set gateway.endpoint=<GATEWAY_HOST:4317>
+{{- end }}
+{{- if and (not .Values.apiKey.value) (not .Values.apiKey.existingSecret) }}
+
+⚠  No agent token configured — the gateway will reject this agent. Provide one:
+     --set apiKey.value=<AGENT_TOKEN>          (chart creates a Secret)
+   or pre-create a Secret and use:
+     --set apiKey.existingSecret=<SECRET_NAME>
+{{- end }}
+
+Your applications send OTLP to the node agent at:
+  http://{{ include "devopsmate-agent.fullname" . }}.{{ include "devopsmate-agent.namespace" . }}.svc.cluster.local:4318   (HTTP)
+  {{ include "devopsmate-agent.fullname" . }}.{{ include "devopsmate-agent.namespace" . }}.svc.cluster.local:4317        (gRPC)
+
+Check rollout:
+  kubectl -n {{ include "devopsmate-agent.namespace" . }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+Then open DevopsMate → Infrastructure to confirm your nodes/pods are reporting (usually within a few seconds).

@@ -1,0 +1,859 @@
+# =============================================================================
+# DevOpsMate OpenTelemetry Collector — VM / Bare-Metal / EC2 Agent
+# Production Configuration v4
+# =============================================================================
+#
+# ARCHITECTURE CHANGE (v3 → v4):
+#   v3:  agent → storage (VictoriaMetrics, ClickHouse, DevOpsMate API)
+#   v4:  agent → GATEWAY → storage
+#
+#   Agents no longer export to storage directly. They forward all telemetry
+#   to the DevOpsMate gateway cluster via OTLP/gRPC. The gateway handles:
+#     - Tail-based trace sampling
+#     - Multi-tenant routing
+#     - Backpressure + buffering
+#     - Fan-out to VictoriaMetrics, ClickHouse, DevOpsMate API
+#
+# NEW IN v4:
+# ┌─────────────────────────────────┬────────────────────────────────────────┐
+# │ Dynamic receiver creation       │ receiver_creator + docker_observer     │
+# │ eBPF kernel-level telemetry     │ Grafana Beyla sidecar (external)       │
+# │ Simplified exporter (to GW)     │ Single otlp/grpc → gateway LB         │
+# └─────────────────────────────────┴────────────────────────────────────────┘
+#
+# Required environment variables:
+#   DEVOPSMATE_TENANT_ID, OTEL_ENVIRONMENT,
+#   DEVOPSMATE_GATEWAY_ENDPOINT  (e.g., otel-gateway.devopsmate.internal:4317)
+#
+# Optional (set only for services on this host):
+#   MYSQL_ENDPOINT, POSTGRES_ENDPOINT, POSTGRES_USER, POSTGRES_PASSWORD,
+#   POSTGRES_DB, REDIS_PASSWORD, MONGO_USER, MONGO_PASSWORD,
+#   RABBITMQ_USER, RABBITMQ_PASSWORD, ES_USER, ES_PASSWORD
+# =============================================================================
+
+receivers:
+  # ===========================================================================
+  # LAYER 0: Application OTLP
+  # ===========================================================================
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 4
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # ===========================================================================
+  # LAYER 1: Host metrics
+  # ===========================================================================
+  hostmetrics:
+    collection_interval: 15s
+    root_path: /
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk: {}
+      filesystem:
+        exclude_mount_points:
+          mount_points: [/dev/*, /proc/*, /sys/*, /run/*, /snap/*]
+          match_type: regexp
+      network:
+        exclude:
+          interfaces: [lo, veth*]
+          match_type: regexp
+      load: {}
+      paging: {}
+      processes: {}
+
+  # ===========================================================================
+  # LAYER 1: Process metrics + service discovery
+  # ===========================================================================
+  process:
+    collection_interval: 15s
+    include:
+      match_type: regexp
+      names:
+        - nginx
+        - apache2
+        - httpd
+        - caddy
+        - envoy
+        - haproxy
+        - mysqld?
+        - postgres
+        - mongod
+        - mongos
+        - redis-server
+        - redis
+        - memcached
+        - rabbitmq
+        - beam\.smp
+        - elasticsearch
+        - opensearch
+        - node
+        - java
+        - python[0-9.]*
+        - ruby
+        - dotnet
+        - php-fpm
+        - gunicorn
+        - uvicorn
+        - puma
+        - pm2
+        - prometheus
+        - grafana
+        - dockerd
+        - containerd
+        - sshd
+    mute_process_exe_error: true
+    mute_process_name_error: true
+
+  # ===========================================================================
+  # LAYER 2: Static integration receivers
+  # Comment out what's not running on this host.
+  # ===========================================================================
+  nginx:
+    endpoint: http://127.0.0.1:80/nginx_status
+    collection_interval: 15s
+
+  apache:
+    endpoint: http://127.0.0.1:80/server-status?auto
+    collection_interval: 15s
+
+  mysql:
+    endpoint: ${env:MYSQL_ENDPOINT}
+    collection_interval: 15s
+    statement_events:
+      digest_text_limit: 120
+      limit: 250
+
+  postgresql:
+    endpoint: ${env:POSTGRES_ENDPOINT}
+    transport: tcp
+    username: ${env:POSTGRES_USER}
+    password: ${env:POSTGRES_PASSWORD}
+    databases: [${env:POSTGRES_DB}]
+    collection_interval: 15s
+    tls:
+      insecure: true
+
+  redis:
+    endpoint: 127.0.0.1:6379
+    collection_interval: 15s
+    password: ${env:REDIS_PASSWORD}
+
+  mongodb:
+    hosts:
+      - endpoint: 127.0.0.1:27017
+    username: ${env:MONGO_USER}
+    password: ${env:MONGO_PASSWORD}
+    collection_interval: 15s
+
+  rabbitmq:
+    endpoint: http://127.0.0.1:15672
+    username: ${env:RABBITMQ_USER}
+    password: ${env:RABBITMQ_PASSWORD}
+    collection_interval: 15s
+
+  elasticsearch:
+    endpoint: http://127.0.0.1:9200
+    username: ${env:ES_USER}
+    password: ${env:ES_PASSWORD}
+    collection_interval: 15s
+    skip_cluster_metrics: false
+    nodes: ["_local"]
+
+  # ===========================================================================
+  # LAYER 3: Prometheus scraper
+  # ===========================================================================
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: otel-collector-self
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
+        - job_name: application-metrics
+          scrape_interval: 15s
+          file_sd_configs:
+            - files:
+                - /etc/otelcol-contrib/discovery/*.json
+                - /etc/otelcol-contrib/discovery/*.yaml
+              refresh_interval: 30s
+        # eBPF metrics from Beyla (if running)
+        - job_name: beyla-ebpf
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["127.0.0.1:9400"]
+              labels:
+                source: ebpf
+
+  # ===========================================================================
+  # LAYER 4: Service-aware log collection
+  # ===========================================================================
+  filelog/nginx:
+    include: [/var/log/nginx/access.log, /var/log/nginx/error.log]
+    start_at: end
+    include_file_name: true
+    include_file_path: true
+    max_log_size: 1MiB
+    poll_interval: 500ms
+    resource:
+      service.name: nginx
+      service.type: web-server
+    operators:
+      - type: regex_parser
+        id: nginx_access
+        regex: '^(?P<remote_addr>[^ ]*) - (?P<remote_user>[^ ]*) \[(?P<time_local>[^\]]*)\] "(?P<request_method>[A-Z]+) (?P<request_path>[^ ]*) (?P<request_protocol>[^"]*)" (?P<status>[0-9]+) (?P<body_bytes_sent>[0-9]+) "(?P<http_referer>[^"]*)" "(?P<http_user_agent>[^"]*)"'
+        on_error: send
+        severity:
+          parse_from: attributes.status
+          mapping:
+            error: ["5"]
+            warn: ["4"]
+            info: ["2", "3"]
+
+  filelog/mysql:
+    include: [/var/log/mysql/*.log]
+    start_at: end
+    include_file_name: true
+    include_file_path: true
+    max_log_size: 1MiB
+    resource:
+      service.name: mysql
+      service.type: database
+    operators:
+      - type: regex_parser
+        id: mysql_error
+        regex: '(?P<timestamp>\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+(?P<thread_id>\d+)\s+\[(?P<severity>[^\]]+)\]'
+        on_error: send
+        severity:
+          parse_from: attributes.severity
+          mapping:
+            error: ["Error", "ERROR"]
+            warn: ["Warning", "WARNING"]
+            info: ["Note", "System"]
+
+  filelog/postgresql:
+    include: [/var/log/postgresql/*.log]
+    start_at: end
+    include_file_name: true
+    include_file_path: true
+    max_log_size: 1MiB
+    resource:
+      service.name: postgresql
+      service.type: database
+    operators:
+      - type: regex_parser
+        id: pg_log
+        regex: '(?P<timestamp>[\d\-]+ [\d:.]+\s\w+)\s+\[(?P<pid>\d+)\]\s+(?P<severity>\w+):'
+        on_error: send
+        severity:
+          parse_from: attributes.severity
+          mapping:
+            error: ["ERROR", "FATAL", "PANIC"]
+            warn: ["WARNING"]
+            info: ["LOG", "INFO", "NOTICE"]
+
+  filelog/redis:
+    include: [/var/log/redis/*.log]
+    start_at: end
+    include_file_name: true
+    include_file_path: true
+    resource:
+      service.name: redis
+      service.type: cache
+
+  filelog/mongodb:
+    include: [/var/log/mongodb/*.log]
+    start_at: end
+    include_file_name: true
+    include_file_path: true
+    max_log_size: 1MiB
+    resource:
+      service.name: mongodb
+      service.type: database
+    operators:
+      - type: router
+        id: mongo_router
+        routes:
+          - output: mongo_json
+            expr: 'body matches "^\\{"'
+        default: mongo_raw
+      - type: json_parser
+        id: mongo_json
+        parse_from: body
+        parse_to: attributes
+        on_error: send
+      - type: move
+        id: mongo_raw
+        from: body
+        to: attributes.raw_log
+
+  filelog/syslog:
+    include: [/var/log/syslog, /var/log/messages, "/var/log/*.log"]
+    exclude:
+      - /var/log/nginx/*.log
+      - /var/log/mysql/*.log
+      - /var/log/postgresql/*.log
+      - /var/log/redis/*.log
+      - /var/log/mongodb/*.log
+      - /var/log/lastlog
+      - /var/log/wtmp
+      - /var/log/btmp
+    start_at: end
+    include_file_name: true
+    include_file_path: true
+    max_log_size: 1MiB
+    poll_interval: 500ms
+    operators:
+      - type: move
+        from: attributes["log.file.path"]
+        to: resource["log.file.path"]
+      - type: router
+        id: syslog_router
+        routes:
+          - output: syslog_json
+            expr: 'body matches "^\\{"'
+        default: syslog_plain
+      - type: json_parser
+        id: syslog_json
+        parse_from: body
+        parse_to: attributes
+        on_error: send
+      - type: move
+        id: syslog_plain
+        from: body
+        to: attributes.raw_log
+      - type: regex_parser
+        id: syslog_severity
+        parse_from: attributes.raw_log
+        regex: '(?P<severity>DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|FATAL|CRITICAL|EMERG|ALERT)'
+        on_error: send
+        severity:
+          parse_from: attributes.severity
+
+  filelog/application:
+    include: ["/var/log/application/*.log", "/opt/*/logs/*.log", "/home/*/app/logs/*.log"]
+    start_at: end
+    include_file_name: true
+    include_file_path: true
+    max_log_size: 1MiB
+    poll_interval: 500ms
+    operators:
+      - type: regex_parser
+        id: app_path_service
+        parse_from: attributes["log.file.path"]
+        regex: '/opt/(?P<detected_service>[^/]+)/logs/|/home/[^/]+/(?P<detected_service_alt>[^/]+)/logs/'
+        on_error: send
+      - type: router
+        id: app_json_router
+        routes:
+          - output: app_json
+            expr: 'body matches "^\\{"'
+        default: app_plain
+      - type: json_parser
+        id: app_json
+        parse_from: body
+        parse_to: attributes
+        on_error: send
+      - type: move
+        id: app_plain
+        from: body
+        to: attributes.raw_log
+
+  # ===========================================================================
+  # Service health monitoring
+  # ===========================================================================
+  httpcheck/nginx:
+    endpoint: http://127.0.0.1:80/
+    method: HEAD
+    collection_interval: 30s
+
+  httpcheck/apache:
+    endpoint: http://127.0.0.1:80/
+    method: HEAD
+    collection_interval: 30s
+
+  httpcheck/elasticsearch:
+    endpoint: http://127.0.0.1:9200/_cluster/health
+    method: GET
+    collection_interval: 30s
+
+  httpcheck/rabbitmq:
+    endpoint: http://127.0.0.1:15672/api/health/checks/alarms
+    method: GET
+    collection_interval: 30s
+
+  tcpcheck/mysql:
+    endpoint: 127.0.0.1:3306
+    collection_interval: 30s
+
+  tcpcheck/postgresql:
+    endpoint: 127.0.0.1:5432
+    collection_interval: 30s
+
+  tcpcheck/redis:
+    endpoint: 127.0.0.1:6379
+    collection_interval: 30s
+
+  tcpcheck/mongodb:
+    endpoint: 127.0.0.1:27017
+    collection_interval: 30s
+
+  # ===========================================================================
+  # Container runtime (Docker) metrics
+  # ===========================================================================
+  docker_stats:
+    endpoint: unix:///var/run/docker.sock
+    collection_interval: 15s
+    timeout: 20s
+    api_version: 1.25
+    metrics:
+      container.cpu.usage.total:
+        enabled: true
+      container.memory.usage.total:
+        enabled: true
+      container.network.io.usage.rx_bytes:
+        enabled: true
+      container.network.io.usage.tx_bytes:
+        enabled: true
+      container.blockio.io_service_bytes_recursive:
+        enabled: true
+
+  # ===========================================================================
+  # NEW — DYNAMIC RECEIVER CREATION
+  # Watches the Docker daemon for containers starting/stopping. When a
+  # container appears that matches a rule, it creates a receiver on-the-fly.
+  # No agent restart needed. This is how Datadog auto-discovery works.
+  #
+  # Example: a MySQL container starts → receiver_creator detects port 3306 →
+  # spawns a mysql receiver pointed at that container's IP.
+  #
+  # Uses the docker_observer extension (defined below) as the discovery source.
+  # ===========================================================================
+  receiver_creator:
+    watch_observers: [docker_observer]
+    receivers:
+      # ── Auto-discover Redis containers ──
+      redis/dynamic:
+        rule: type == "container" and port == 6379
+        config:
+          endpoint: '`endpoint`'
+          collection_interval: 15s
+
+      # ── Auto-discover MySQL containers ──
+      mysql/dynamic:
+        rule: type == "container" and port == 3306
+        config:
+          endpoint: '`endpoint`'
+          collection_interval: 15s
+
+      # ── Auto-discover PostgreSQL containers ──
+      postgresql/dynamic:
+        rule: type == "container" and port == 5432
+        config:
+          endpoint: '`endpoint`'
+          collection_interval: 15s
+          tls:
+            insecure: true
+
+      # ── Auto-discover MongoDB containers ──
+      mongodb/dynamic:
+        rule: type == "container" and port == 27017
+        config:
+          hosts:
+            - endpoint: '`endpoint`'
+          collection_interval: 15s
+
+      # ── Auto-discover Nginx containers (stub_status on 80) ──
+      nginx/dynamic:
+        rule: type == "container" and port == 80
+        config:
+          endpoint: 'http://`endpoint`/nginx_status'
+          collection_interval: 15s
+
+      # ── Auto-discover Elasticsearch containers ──
+      elasticsearch/dynamic:
+        rule: type == "container" and port == 9200
+        config:
+          endpoint: 'http://`endpoint`'
+          collection_interval: 15s
+          nodes: ["_local"]
+
+      # ── Auto-discover RabbitMQ management containers ──
+      rabbitmq/dynamic:
+        rule: type == "container" and port == 15672
+        config:
+          endpoint: 'http://`endpoint`'
+          collection_interval: 15s
+
+      # ── Health-check any HTTP container on well-known ports ──
+      httpcheck/dynamic_8080:
+        rule: type == "container" and port == 8080
+        config:
+          endpoint: 'http://`endpoint`/health'
+          method: GET
+          collection_interval: 30s
+
+      httpcheck/dynamic_3000:
+        rule: type == "container" and port == 3000
+        config:
+          endpoint: 'http://`endpoint`/health'
+          method: GET
+          collection_interval: 30s
+
+processors:
+  # ===========================================================================
+  # Memory limiter — ALWAYS first
+  # ===========================================================================
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # ===========================================================================
+  # Resource detection — EC2
+  # ===========================================================================
+  resourcedetection:
+    detectors: [env, system, ec2]
+    timeout: 5s
+    override: false
+    system:
+      hostname_sources: [os]
+      resource_attributes:
+        host.id:
+          enabled: true
+
+  # ===========================================================================
+  # Resource attributes — DevOpsMate tenant
+  # ===========================================================================
+  resource:
+    attributes:
+      - key: service.namespace
+        action: upsert
+        value: devopsmate
+      - key: devopsmate.tenant_id
+        action: upsert
+        value: ${env:DEVOPSMATE_TENANT_ID}
+      - key: tenant_id
+        action: upsert
+        value: ${env:DEVOPSMATE_TENANT_ID}
+      - key: env
+        action: upsert
+        value: ${env:OTEL_ENVIRONMENT}
+      - key: host
+        action: upsert
+        value: ${env:HOSTNAME}
+      - key: hostname
+        action: upsert
+        value: ${env:HOSTNAME}
+      - key: collector.type
+        action: upsert
+        value: agent-vm
+
+  resource/container:
+    attributes:
+      - key: service.namespace
+        action: upsert
+        value: devopsmate
+      - key: devopsmate.tenant_id
+        action: upsert
+        value: ${env:DEVOPSMATE_TENANT_ID}
+      - key: tenant_id
+        action: upsert
+        value: ${env:DEVOPSMATE_TENANT_ID}
+      - key: env
+        action: upsert
+        value: ${env:OTEL_ENVIRONMENT}
+      - key: collector.type
+        action: upsert
+        value: agent-vm
+
+  # ===========================================================================
+  # Service name normalization (Layer 5)
+  # ===========================================================================
+  transform/service_detection:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(resource.attributes["service.name"], "nginx") where resource.attributes["process.executable.name"] == "nginx" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.type"], "web-server") where resource.attributes["process.executable.name"] == "nginx"
+          - set(resource.attributes["service.name"], "apache") where resource.attributes["process.executable.name"] == "apache2" or resource.attributes["process.executable.name"] == "httpd" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.type"], "web-server") where resource.attributes["process.executable.name"] == "apache2" or resource.attributes["process.executable.name"] == "httpd"
+          - set(resource.attributes["service.name"], "mysql") where resource.attributes["process.executable.name"] == "mysqld" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.type"], "database") where resource.attributes["process.executable.name"] == "mysqld"
+          - set(resource.attributes["service.name"], "postgresql") where resource.attributes["process.executable.name"] == "postgres" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.type"], "database") where resource.attributes["process.executable.name"] == "postgres"
+          - set(resource.attributes["service.name"], "mongodb") where resource.attributes["process.executable.name"] == "mongod" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.type"], "database") where resource.attributes["process.executable.name"] == "mongod"
+          - set(resource.attributes["service.name"], "redis") where resource.attributes["process.executable.name"] == "redis-server" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.type"], "cache") where resource.attributes["process.executable.name"] == "redis-server"
+          - set(resource.attributes["service.name"], "rabbitmq") where resource.attributes["process.executable.name"] == "beam.smp" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.type"], "message-queue") where resource.attributes["process.executable.name"] == "beam.smp"
+          - set(resource.attributes["service.name"], "elasticsearch") where resource.attributes["process.executable.name"] == "elasticsearch" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.type"], "search") where resource.attributes["process.executable.name"] == "elasticsearch"
+          - set(resource.attributes["service.name"], "node-app") where resource.attributes["process.executable.name"] == "node" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], "java-app") where resource.attributes["process.executable.name"] == "java" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], "python-app") where IsMatch(resource.attributes["process.executable.name"], "python.*") or resource.attributes["process.executable.name"] == "gunicorn" or resource.attributes["process.executable.name"] == "uvicorn" and resource.attributes["service.name"] == nil
+    log_statements:
+      - context: log
+        statements:
+          - set(resource.attributes["service.name"], attributes["detected_service"]) where attributes["detected_service"] != nil and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], attributes["detected_service_alt"]) where attributes["detected_service_alt"] != nil and resource.attributes["service.name"] == nil
+          - delete_key(attributes, "detected_service") where attributes["detected_service"] != nil
+          - delete_key(attributes, "detected_service_alt") where attributes["detected_service_alt"] != nil
+
+  # ===========================================================================
+  # Port-to-service mapping (Layer 6)
+  # ===========================================================================
+  transform/port_mapping:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(resource.attributes["service.name"], "mysql") where resource.attributes["network.port"] == "3306" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], "postgresql") where resource.attributes["network.port"] == "5432" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], "mongodb") where resource.attributes["network.port"] == "27017" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], "redis") where resource.attributes["network.port"] == "6379" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], "rabbitmq") where resource.attributes["network.port"] == "5672" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], "kafka") where resource.attributes["network.port"] == "9092" and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.name"], "elasticsearch") where resource.attributes["network.port"] == "9200" and resource.attributes["service.name"] == nil
+
+  # ===========================================================================
+  # Trace-log correlation
+  # ===========================================================================
+  transform/trace_log_correlation:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["trace_id"], attributes["traceId"]) where attributes["trace_id"] == nil and attributes["traceId"] != nil
+          - set(attributes["trace_id"], attributes["TraceId"]) where attributes["trace_id"] == nil and attributes["TraceId"] != nil
+          - set(attributes["trace_id"], attributes["traceID"]) where attributes["trace_id"] == nil and attributes["traceID"] != nil
+          - set(attributes["trace_id"], attributes["dd.trace_id"]) where attributes["trace_id"] == nil and attributes["dd.trace_id"] != nil
+          - set(attributes["trace_id"], attributes["x-amzn-trace-id"]) where attributes["trace_id"] == nil and attributes["x-amzn-trace-id"] != nil
+          - set(attributes["span_id"], attributes["spanId"]) where attributes["span_id"] == nil and attributes["spanId"] != nil
+          - set(attributes["span_id"], attributes["SpanId"]) where attributes["span_id"] == nil and attributes["SpanId"] != nil
+          - set(attributes["span_id"], attributes["dd.span_id"]) where attributes["span_id"] == nil and attributes["dd.span_id"] != nil
+          - set(trace_id.string, attributes["trace_id"]) where trace_id == nil and attributes["trace_id"] != nil
+          - set(span_id.string, attributes["span_id"]) where span_id == nil and attributes["span_id"] != nil
+          - delete_key(attributes, "traceId") where attributes["traceId"] != nil
+          - delete_key(attributes, "TraceId") where attributes["TraceId"] != nil
+          - delete_key(attributes, "traceID") where attributes["traceID"] != nil
+          - delete_key(attributes, "dd.trace_id") where attributes["dd.trace_id"] != nil
+          - delete_key(attributes, "spanId") where attributes["spanId"] != nil
+          - delete_key(attributes, "SpanId") where attributes["SpanId"] != nil
+          - delete_key(attributes, "dd.span_id") where attributes["dd.span_id"] != nil
+
+  # ===========================================================================
+  # Container service mapping
+  # ===========================================================================
+  transform/container_service:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(resource.attributes["service.name"], resource.attributes["container.name"]) where resource.attributes["container.name"] != nil and resource.attributes["service.name"] == nil
+          - set(resource.attributes["service.instance.source"], "docker") where resource.attributes["container.id"] != nil
+
+  # ===========================================================================
+  # Log enrichment
+  # ===========================================================================
+  attributes/logs:
+    actions:
+      - key: log.source
+        from_attribute: log.file.name
+        action: upsert
+
+  # ===========================================================================
+  # Filters
+  # ===========================================================================
+  filter/metrics:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'name == "process.runtime.go.mem.heap_alloc"'
+
+  filter/logs:
+    error_mode: ignore
+    logs:
+      log_record:
+        - 'IsMatch(body, ".*health.*check.*") == true'
+        - 'IsMatch(body, ".*GET /healthz.*") == true'
+        - 'IsMatch(body, ".*GET /readyz.*") == true'
+        - 'IsMatch(body, ".*GET /nginx_status.*") == true'
+        - 'IsMatch(body, ".*GET /server-status.*") == true'
+
+  # ===========================================================================
+  # Batch per signal
+  # ===========================================================================
+  batch/metrics:
+    timeout: 15s
+    send_batch_size: 2048
+    send_batch_max_size: 4096
+
+  batch/logs:
+    timeout: 5s
+    send_batch_size: 2000
+    send_batch_max_size: 4000
+
+  batch/traces:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+exporters:
+  # ===========================================================================
+  # SINGLE EXPORTER: agent → DevOpsMate gateway cluster
+  # The gateway handles fan-out to VictoriaMetrics, ClickHouse, DevOpsMate API.
+  # This simplifies the agent drastically and removes storage coupling.
+  # ===========================================================================
+  otlp/gateway:
+    endpoint: ${env:DEVOPSMATE_GATEWAY_ENDPOINT}
+    # Secure by default: authenticate every agent with the gateway token + TLS.
+    # Auth is independent of TLS (set DEVOPSMATE_OTLP_INSECURE=true for a
+    # not-yet-TLS internal gateway while still authenticating the agent).
+    auth:
+      authenticator: bearertokenauth/gateway
+    tls:
+      insecure: ${env:DEVOPSMATE_OTLP_INSECURE}
+      insecure_skip_verify: ${env:DEVOPSMATE_TLS_SKIP_VERIFY}
+    compression: zstd
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 10000
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    timeout: 30s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: /health
+
+  # Authenticate agent → gateway with the shared agent token (validated at the gateway)
+  bearertokenauth/gateway:
+    token: ${env:DEVOPSMATE_API_KEY}
+
+  pprof:
+    endpoint: 127.0.0.1:1777
+
+  # Docker observer — discovery source for receiver_creator
+  docker_observer:
+    endpoint: unix:///var/run/docker.sock
+    timeout: 5s
+
+  # Persistent queue storage — survives agent restarts
+  file_storage:
+    directory: /var/lib/otelcol-contrib/storage
+    timeout: 10s
+    compaction:
+      on_start: true
+      directory: /var/lib/otelcol-contrib/storage
+
+service:
+  extensions: [health_check, bearertokenauth/gateway, pprof, docker_observer, file_storage]
+
+  telemetry:
+    logs:
+      level: info
+      encoding: json
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888
+
+  pipelines:
+    # ===== METRICS =====
+
+    metrics/host:
+      receivers: [hostmetrics, process, otlp]
+      processors: [memory_limiter, resourcedetection, resource, transform/service_detection, transform/port_mapping, filter/metrics, batch/metrics]
+      exporters: [otlp/gateway]
+
+    metrics/integrations:
+      receivers: [nginx, apache, mysql, postgresql, redis, mongodb, rabbitmq, elasticsearch]
+      processors: [memory_limiter, resourcedetection, resource, batch/metrics]
+      exporters: [otlp/gateway]
+
+    metrics/prometheus:
+      receivers: [prometheus]
+      processors: [memory_limiter, resourcedetection, resource, batch/metrics]
+      exporters: [otlp/gateway]
+
+    metrics/health:
+      receivers: [httpcheck/nginx, httpcheck/apache, httpcheck/elasticsearch, httpcheck/rabbitmq, tcpcheck/mysql, tcpcheck/postgresql, tcpcheck/redis, tcpcheck/mongodb]
+      processors: [memory_limiter, resourcedetection, resource, batch/metrics]
+      exporters: [otlp/gateway]
+
+    metrics/containers:
+      receivers: [docker_stats]
+      processors: [memory_limiter, resourcedetection, resource/container, transform/container_service, batch/metrics]
+      exporters: [otlp/gateway]
+
+    # Dynamic receivers feed into this pipeline automatically
+    metrics/dynamic:
+      receivers: [receiver_creator]
+      processors: [memory_limiter, resourcedetection, resource, batch/metrics]
+      exporters: [otlp/gateway]
+
+    # ===== LOGS =====
+
+    logs/nginx:
+      receivers: [filelog/nginx]
+      processors: [memory_limiter, resourcedetection, resource, transform/trace_log_correlation, attributes/logs, filter/logs, batch/logs]
+      exporters: [otlp/gateway]
+
+    logs/mysql:
+      receivers: [filelog/mysql]
+      processors: [memory_limiter, resourcedetection, resource, transform/trace_log_correlation, attributes/logs, batch/logs]
+      exporters: [otlp/gateway]
+
+    logs/postgresql:
+      receivers: [filelog/postgresql]
+      processors: [memory_limiter, resourcedetection, resource, transform/trace_log_correlation, attributes/logs, batch/logs]
+      exporters: [otlp/gateway]
+
+    logs/redis:
+      receivers: [filelog/redis]
+      processors: [memory_limiter, resourcedetection, resource, transform/trace_log_correlation, attributes/logs, batch/logs]
+      exporters: [otlp/gateway]
+
+    logs/mongodb:
+      receivers: [filelog/mongodb]
+      processors: [memory_limiter, resourcedetection, resource, transform/trace_log_correlation, attributes/logs, batch/logs]
+      exporters: [otlp/gateway]
+
+    logs/system:
+      receivers: [filelog/syslog]
+      processors: [memory_limiter, resourcedetection, resource, transform/service_detection, transform/trace_log_correlation, attributes/logs, filter/logs, batch/logs]
+      exporters: [otlp/gateway]
+
+    logs/application:
+      receivers: [filelog/application]
+      processors: [memory_limiter, resourcedetection, resource, transform/service_detection, transform/trace_log_correlation, attributes/logs, filter/logs, batch/logs]
+      exporters: [otlp/gateway]
+
+    logs/otlp:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, resource, transform/trace_log_correlation, batch/logs]
+      exporters: [otlp/gateway]
+
+    # ===== TRACES =====
+
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, resource, batch/traces]
+      exporters: [otlp/gateway]

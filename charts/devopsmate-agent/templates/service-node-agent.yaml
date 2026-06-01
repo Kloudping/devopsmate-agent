@@ -1,0 +1,19 @@
+{{- if .Values.nodeAgent.enabled -}}
+# Apps in the cluster send OTLP to this Service (or to the node's agent directly).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "devopsmate-agent.fullname" . }}
+  namespace: {{ include "devopsmate-agent.namespace" . }}
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    component: node-agent
+  internalTrafficPolicy: Local   # route to the agent on the caller's own node
+  ports:
+    - { name: otlp-grpc, port: 4317, targetPort: 4317, protocol: TCP }
+    - { name: otlp-http, port: 4318, targetPort: 4318, protocol: TCP }
+{{- end }}

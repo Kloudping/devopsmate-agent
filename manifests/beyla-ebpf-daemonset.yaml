@@ -1,0 +1,173 @@
+# =============================================================================
+# DevOpsMate eBPF Telemetry — Grafana Beyla DaemonSet
+# =============================================================================
+#
+# WHY eBPF:
+#   Some observability data cannot be captured from user space:
+#   - Network flows between services (without modifying app code)
+#   - Syscall latency (file I/O, socket operations)
+#   - TCP retransmits, connection states
+#   - DNS resolution timing
+#   - Auto-instrumented HTTP/gRPC/SQL traces (zero-code)
+#
+# WHAT BEYLA PROVIDES:
+#   - Automatic HTTP/gRPC trace generation (no SDK needed)
+#   - RED metrics (rate, error, duration) for every service
+#   - Network flow metrics (bytes, connections, retransmits)
+#   - DNS latency metrics
+#   - Feeds into the OTel agent via OTLP, which forwards to gateway
+#
+# DEPLOYMENT: DaemonSet alongside the OTel agent DaemonSet.
+# Beyla needs: hostPID=true, privileged or CAP_SYS_ADMIN, /sys/kernel mounted.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: beyla-config
+  namespace: devopsmate
+data:
+  beyla-config.yml: |
+    # ── Service discovery: auto-instrument everything ──
+    discovery:
+      services:
+        # Instrument all processes (filter later at the gateway)
+        - name: ""
+          namespace: ""
+          open_ports: 80,443,3000,5000,8000,8080,8443,9090
+
+    # ── What to collect ──
+    ebpf:
+      # Track incoming HTTP/gRPC requests
+      track_request_headers: true
+      # Enable high-resolution histograms
+      hires_timer: true
+
+    # ── Network flow metrics (TCP connections, DNS) ──
+    network:
+      enable: true
+      # Report network flows between services
+      cidrs:
+        - 10.0.0.0/8       # Pod CIDR
+        - 172.16.0.0/12     # Service CIDR
+        - 192.168.0.0/16    # Node CIDR
+
+    # ── Output: send to the OTel agent on the same node ──
+    otel_traces_export:
+      endpoint: http://localhost:4318/v1/traces
+    otel_metrics_export:
+      endpoint: http://localhost:4318/v1/metrics
+      interval: 15s
+
+    # ── Prometheus endpoint (for the OTel agent to scrape) ──
+    prometheus_export:
+      port: 9400
+      path: /metrics
+
+    # ── Attributes to attach ──
+    attributes:
+      kubernetes:
+        enable: true
+      select:
+        # Include these in all exported spans/metrics
+        beyla_network_flow:
+          include: ["src.name", "dst.name", "src.namespace", "dst.namespace", "direction", "protocol"]
+        beyla_network_flow_bytes:
+          include: ["src.name", "dst.name", "direction"]
+
+    # ── Internal metrics ──
+    internal_metrics:
+      prometheus:
+        port: 9401
+        path: /internal/metrics
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: beyla-ebpf
+  namespace: devopsmate
+  labels:
+    app.kubernetes.io/name: beyla
+    app.kubernetes.io/component: ebpf-agent
+    app.kubernetes.io/part-of: devopsmate
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: beyla
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: beyla
+        app.kubernetes.io/component: ebpf-agent
+      annotations:
+        devopsmate.io/service-name: beyla-ebpf
+    spec:
+      serviceAccountName: otel-agent
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+
+      containers:
+        - name: beyla
+          image: grafana/beyla:1.9.6
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: BEYLA_CONFIG_PATH
+              value: /config/beyla-config.yml
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://localhost:4318
+            - name: OTEL_SERVICE_NAME
+              value: beyla-ebpf
+            - name: BEYLA_KUBE_METADATA_ENABLE
+              value: "autodetect"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: beyla-config
+              mountPath: /config
+            - name: sys-kernel
+              mountPath: /sys/kernel
+              readOnly: true
+          ports:
+            - name: prom
+              containerPort: 9400
+            - name: internal
+              containerPort: 9401
+
+      volumes:
+        - name: beyla-config
+          configMap:
+            name: beyla-config
+        - name: sys-kernel
+          hostPath:
+            path: /sys/kernel
+
+---
+# =============================================================================
+# SERVICE MONITOR (if using Prometheus Operator)
+# Scrapes Beyla's Prometheus endpoint for internal health metrics
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: beyla-ebpf
+  namespace: devopsmate
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: beyla
+  endpoints:
+    - port: prom
+      interval: 30s
+      path: /metrics

@@ -1,0 +1,57 @@
+{{- if .Values.clusterAgent.enabled -}}
+{{- $prof := include "devopsmate-agent.profile" . | fromJson -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "devopsmate-agent.fullname" . }}-cluster
+  namespace: {{ include "devopsmate-agent.namespace" . }}
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+    component: cluster-agent
+spec:
+  replicas: {{ .Values.clusterAgent.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      component: cluster-agent
+  template:
+    metadata:
+      labels:
+        {{- include "devopsmate-agent.labels" . | nindent 8 }}
+        component: cluster-agent
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-cluster-agent.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "devopsmate-agent.serviceAccountName" . }}
+      containers:
+        - name: otel-cluster-agent
+          image: {{ include "devopsmate-agent.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config=/etc/otelcol/config.yaml"]
+          env:
+            {{- include "devopsmate-agent.commonEnv" . | nindent 12 }}
+          ports:
+            - { name: health, containerPort: 13133 }
+            - { name: metrics, containerPort: 8888 }
+          resources:
+            {{- if .Values.clusterAgent.resources }}
+            {{- toYaml .Values.clusterAgent.resources | nindent 12 }}
+            {{- else }}
+            requests: { cpu: {{ $prof.cpuReq | quote }}, memory: {{ $prof.memReq | quote }} }
+            limits:   { cpu: {{ $prof.cpuLim | quote }}, memory: {{ $prof.memLim | quote }} }
+            {{- end }}
+          livenessProbe:
+            httpGet: { path: /health, port: 13133 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /health, port: 13133 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - { name: config, mountPath: /etc/otelcol/config.yaml, subPath: config.yaml, readOnly: true }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "devopsmate-agent.fullname" . }}-cluster
+{{- end }}

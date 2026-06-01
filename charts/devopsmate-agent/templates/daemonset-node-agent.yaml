@@ -1,0 +1,89 @@
+{{- if .Values.nodeAgent.enabled -}}
+{{- $prof := include "devopsmate-agent.profile" . | fromJson -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "devopsmate-agent.fullname" . }}-node
+  namespace: {{ include "devopsmate-agent.namespace" . }}
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+    component: node-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      component: node-agent
+  template:
+    metadata:
+      labels:
+        {{- include "devopsmate-agent.labels" . | nindent 8 }}
+        component: node-agent
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-node-agent.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "devopsmate-agent.serviceAccountName" . }}
+      hostNetwork: false
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        {{- toYaml .Values.nodeAgent.tolerations | nindent 8 }}
+      {{- with .Values.nodeAgent.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeAgent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsUser: 0
+      containers:
+        - name: otel-agent
+          image: {{ include "devopsmate-agent.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config=/etc/otelcol/config.yaml"]
+          env:
+            {{- include "devopsmate-agent.commonEnv" . | nindent 12 }}
+          ports:
+            - { name: otlp-grpc, containerPort: 4317 }
+            - { name: otlp-http, containerPort: 4318 }
+            - { name: health, containerPort: 13133 }
+            - { name: metrics, containerPort: 8888 }
+          resources:
+            {{- if .Values.nodeAgent.resources }}
+            {{- toYaml .Values.nodeAgent.resources | nindent 12 }}
+            {{- else }}
+            requests: { cpu: {{ $prof.cpuReq | quote }}, memory: {{ $prof.memReq | quote }} }
+            limits:   { cpu: {{ $prof.cpuLim | quote }}, memory: {{ $prof.memLim | quote }} }
+            {{- end }}
+          livenessProbe:
+            httpGet: { path: /health, port: 13133 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /health, port: 13133 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - { name: config, mountPath: /etc/otelcol/config.yaml, subPath: config.yaml, readOnly: true }
+            {{- if .Values.metrics.enabled }}
+            - { name: hostfs, mountPath: /hostfs, readOnly: true, mountPropagation: HostToContainer }
+            {{- end }}
+            {{- if .Values.logs.enabled }}
+            - { name: varlogpods, mountPath: /var/log/pods, readOnly: true }
+            - { name: varlibdockercontainers, mountPath: /var/lib/docker/containers, readOnly: true }
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "devopsmate-agent.fullname" . }}-node
+        {{- if .Values.metrics.enabled }}
+        - name: hostfs
+          hostPath: { path: / }
+        {{- end }}
+        {{- if .Values.logs.enabled }}
+        - name: varlogpods
+          hostPath: { path: /var/log/pods }
+        - name: varlibdockercontainers
+          hostPath: { path: /var/lib/docker/containers }
+        {{- end }}
+{{- end }}

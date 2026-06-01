@@ -1,0 +1,17 @@
+apiVersion: v2
+name: devopsmate-agent
+description: DevopsMate OpenTelemetry agent — secure, lightweight, real-time telemetry (metrics, logs, traces, eBPF) for any Kubernetes cluster (AKS/EKS/GKE/k3s/self-managed).
+type: application
+version: 0.1.0
+# Pinned OpenTelemetry Collector contrib tag — keep in sync with otel/VERSIONS.md
+appVersion: "0.147.0"
+kubeVersion: ">=1.24.0-0"
+home: https://devopsmate.io
+keywords:
+  - opentelemetry
+  - observability
+  - monitoring
+  - apm
+  - ebpf
+maintainers:
+  - name: DevopsMate

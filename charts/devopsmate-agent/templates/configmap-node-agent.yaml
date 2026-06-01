@@ -1,0 +1,152 @@
+{{- if .Values.nodeAgent.enabled -}}
+{{- $prof := include "devopsmate-agent.profile" . | fromJson -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "devopsmate-agent.fullname" . }}-node
+  namespace: {{ include "devopsmate-agent.namespace" . }}
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+      {{- if .Values.metrics.enabled }}
+      hostmetrics:
+        collection_interval: {{ $prof.interval }}
+        root_path: /hostfs
+        scrapers:
+          cpu:
+            metrics:
+              system.cpu.utilization:
+                enabled: true
+          memory:
+            metrics:
+              system.memory.utilization:
+                enabled: true
+          disk: {}
+          filesystem:
+            exclude_mount_points:
+              mount_points: [/dev/*, /proc/*, /sys/*, /run/*, /snap/*]
+              match_type: regexp
+          network:
+            exclude:
+              interfaces: [lo, veth*]
+              match_type: regexp
+          load: {}
+          {{- range $prof.extraScrapers }}
+          {{ . }}: {}
+          {{- end }}
+      kubeletstats:
+        collection_interval: {{ $prof.interval }}
+        auth_type: serviceAccount
+        endpoint: https://${env:K8S_NODE_NAME}:10250
+        insecure_skip_verify: true
+      {{- end }}
+      {{- if .Values.logs.enabled }}
+      filelog:
+        include: [/var/log/pods/*/*/*.log]
+        {{- if not .Values.nodeAgent.collectKubeSystem }}
+        exclude: [/var/log/pods/kube-system_*/*/*.log]
+        {{- end }}
+        start_at: end
+        include_file_path: true
+        poll_interval: 500ms
+        max_log_size: 1MiB
+        operators:
+          - type: container
+            id: container-parser
+      {{- end }}
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_mib: {{ $prof.memLimitMib }}
+        spike_limit_mib: {{ $prof.spikeMib }}
+      batch:
+        timeout: 1s
+        send_batch_size: 1024
+        send_batch_max_size: 4096
+      k8sattributes:
+        auth_type: serviceAccount
+        passthrough: false
+        filter:
+          node_from_env_var: K8S_NODE_NAME
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.node.name
+        pod_association:
+          - sources:
+              - from: resource_attribute
+                name: k8s.pod.uid
+          - sources:
+              - from: connection
+      resourcedetection:
+        detectors: [env, system]
+        timeout: 5s
+        override: false
+      resource:
+        attributes:
+          - { key: service.namespace, action: upsert, value: devopsmate }
+          - { key: devopsmate.tenant_id, action: upsert, value: "${env:DEVOPSMATE_TENANT_ID}" }
+          - { key: tenant_id, action: upsert, value: "${env:DEVOPSMATE_TENANT_ID}" }
+          - { key: env, action: upsert, value: "${env:OTEL_ENVIRONMENT}" }
+          {{- if .Values.global.clusterName }}
+          - { key: k8s.cluster.name, action: upsert, value: {{ .Values.global.clusterName | quote }} }
+          {{- end }}
+          - { key: collector.type, action: upsert, value: agent-node }
+
+    exporters:
+      otlp/gateway:
+        endpoint: "${env:DEVOPSMATE_GATEWAY_ENDPOINT}"
+        auth:
+          authenticator: bearertokenauth/gateway
+        tls:
+          insecure: ${env:DEVOPSMATE_OTLP_INSECURE}
+          insecure_skip_verify: ${env:DEVOPSMATE_TLS_SKIP_VERIFY}
+        compression: zstd
+        sending_queue: { enabled: true, num_consumers: 4, queue_size: 10000 }
+        retry_on_failure: { enabled: true, initial_interval: 5s, max_interval: 30s, max_elapsed_time: 300s }
+        timeout: 30s
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+        path: /health
+      bearertokenauth/gateway:
+        token: ${env:DEVOPSMATE_API_KEY}
+
+    service:
+      extensions: [health_check, bearertokenauth/gateway]
+      telemetry:
+        logs: { level: info }
+        metrics: { level: normal, address: 0.0.0.0:8888 }
+      pipelines:
+        {{- if .Values.metrics.enabled }}
+        metrics:
+          receivers: [otlp, hostmetrics, kubeletstats]
+          processors: [memory_limiter, k8sattributes, resourcedetection, resource, batch]
+          exporters: [otlp/gateway]
+        {{- end }}
+        {{- if .Values.logs.enabled }}
+        logs:
+          receivers: [otlp, filelog]
+          processors: [memory_limiter, k8sattributes, resourcedetection, resource, batch]
+          exporters: [otlp/gateway]
+        {{- end }}
+        {{- if .Values.traces.enabled }}
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, k8sattributes, resourcedetection, resource, batch]
+          exporters: [otlp/gateway]
+        {{- end }}
+{{- end }}
