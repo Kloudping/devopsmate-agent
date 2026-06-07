@@ -46,11 +46,19 @@ data:
     exporters:
       otlp/gateway:
         endpoint: "${env:DEVOPSMATE_GATEWAY_ENDPOINT}"
+        {{- if not .Values.gateway.tls.insecure }}
+        # gRPC refuses to send a bearer token over a plaintext connection
+        # ("credentials require transport level security"), so only attach the
+        # authenticator when the gateway link is TLS (insecure=false).
         auth:
           authenticator: bearertokenauth/gateway
+        {{- end }}
         tls:
-          insecure: ${env:DEVOPSMATE_OTLP_INSECURE}
-          insecure_skip_verify: ${env:DEVOPSMATE_TLS_SKIP_VERIFY}
+          # Render real YAML booleans from Helm values. Routing these through
+          # ${env:...} yields a string the collector won't coerce, leaving
+          # insecure=false (gRPC then demands TLS and the exporter fails to start).
+          insecure: {{ .Values.gateway.tls.insecure }}
+          insecure_skip_verify: {{ .Values.gateway.tls.insecureSkipVerify }}
         compression: zstd
         sending_queue: { enabled: true, num_consumers: 2, queue_size: 5000 }
         retry_on_failure: { enabled: true, initial_interval: 5s, max_interval: 30s, max_elapsed_time: 300s }
@@ -60,14 +68,25 @@ data:
       health_check:
         endpoint: 0.0.0.0:13133
         path: /health
+      {{- if not .Values.gateway.tls.insecure }}
       bearertokenauth/gateway:
         token: ${env:DEVOPSMATE_API_KEY}
+      {{- end }}
 
     service:
-      extensions: [health_check, bearertokenauth/gateway]
+      extensions: {{ if not .Values.gateway.tls.insecure }}[health_check, bearertokenauth/gateway]{{ else }}[health_check]{{ end }}
       telemetry:
         logs: { level: info }
-        metrics: { level: normal, address: 0.0.0.0:8888 }
+        metrics:
+          level: normal
+          # Collector v0.123+ removed `metrics.address`; expose internal metrics
+          # on :8888 via the Go SDK pull/prometheus reader instead.
+          readers:
+            - pull:
+                exporter:
+                  prometheus:
+                    host: 0.0.0.0
+                    port: 8888
       pipelines:
         {{- if .Values.clusterAgent.collectClusterMetrics }}
         metrics:

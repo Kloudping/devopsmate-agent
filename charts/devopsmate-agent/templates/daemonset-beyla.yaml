@@ -39,6 +39,13 @@ spec:
               add: ["BPF", "PERFMON", "SYS_ADMIN", "NET_RAW", "DAC_READ_SEARCH"]
             {{- end }}
           env:
+            # Node name via the downward API. Beyla otherwise stamps host.name with
+            # its POD hostname, registering a phantom host that churns every restart;
+            # pin it to the node so its telemetry attributes to the node like the agent.
+            - name: K8S_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: BEYLA_OPEN_PORT
               value: {{ .Values.beyla.openPorts | quote }}
             - name: BEYLA_KUBERNETES_ENABLE
@@ -48,7 +55,7 @@ spec:
             - name: OTEL_EXPORTER_OTLP_PROTOCOL
               value: "http/protobuf"
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: "service.namespace=devopsmate,collector.type=beyla"
+              value: "service.namespace=devopsmate,collector.type=beyla,host.name=$(K8S_NODE_NAME)"
           resources:
             {{- toYaml .Values.beyla.resources | nindent 12 }}
           volumeMounts:

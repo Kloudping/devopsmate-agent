@@ -69,8 +69,13 @@ beyla:
   openPorts: "80,443,3000,5000,8000,8080,8443,9000,9090"  # only instrument these (don't trace everything)
   privileged: true          # eBPF; set false to use scoped CAP_BPF/CAP_PERFMON/CAP_SYS_ADMIN (kernel >=5.8)
   resources:
-    requests: { cpu: 100m, memory: 128Mi }
-    limits:   { cpu: 500m, memory: 256Mi }
+    # eBPF program load spikes memory at startup and steady-state memory scales
+    # with the number of instrumented services, so 256Mi OOM-kills Beyla 1.9.6
+    # before it finishes loading (exit 137) and busy nodes exceed 512Mi
+    # (observed ~610Mi instrumenting a full stack). The limit is only a ceiling;
+    # light nodes stay near the request.
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 1Gi }
 
 serviceAccount:
   create: true
