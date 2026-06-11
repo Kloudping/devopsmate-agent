@@ -3,6 +3,27 @@ entries:
   devopsmate-agent:
   - apiVersion: v2
     appVersion: 0.147.0
+    created: "2026-06-11T16:48:29.94313955Z"
+    description: DevopsMate OpenTelemetry agent — secure, lightweight, real-time telemetry
+      (metrics, logs, traces, eBPF) for any Kubernetes cluster (AKS/EKS/GKE/k3s/self-managed).
+    digest: 76005562f89f947770ce86960143da3ea5678ffa09a4205a214e50e11f436ab4
+    home: https://devopsmate.io
+    keywords:
+    - opentelemetry
+    - observability
+    - monitoring
+    - apm
+    - ebpf
+    kubeVersion: '>=1.24.0-0'
+    maintainers:
+    - name: DevopsMate
+    name: devopsmate-agent
+    type: application
+    urls:
+    - https://github.com/Kloudping/devopsmate-agent/releases/download/devopsmate-agent-0.1.4/devopsmate-agent-0.1.4.tgz
+    version: 0.1.4
+  - apiVersion: v2
+    appVersion: 0.147.0
     created: "2026-06-11T06:50:26.084058553Z"
     description: DevopsMate OpenTelemetry agent — secure, lightweight, real-time telemetry
       (metrics, logs, traces, eBPF) for any Kubernetes cluster (AKS/EKS/GKE/k3s/self-managed).
@@ -64,4 +85,4 @@ entries:
     urls:
     - https://github.com/Kloudping/devopsmate-agent/releases/download/devopsmate-agent-0.1.1/devopsmate-agent-0.1.1.tgz
     version: 0.1.1
-generated: "2026-06-11T06:50:26.084073954Z"
+generated: "2026-06-11T16:48:29.943159438Z"
