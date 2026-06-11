@@ -1,0 +1,17 @@
+{{- if and .Values.uninstaller.enabled .Values.api.endpoint .Values.rbac.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "devopsmate-agent.fullname" . }}-uninstaller
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+    component: uninstaller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "devopsmate-agent.fullname" . }}-uninstaller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "devopsmate-agent.fullname" . }}-uninstaller
+    namespace: {{ include "devopsmate-agent.namespace" . }}
+{{- end }}

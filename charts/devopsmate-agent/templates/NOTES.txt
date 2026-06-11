@@ -29,3 +29,15 @@ Check rollout:
   kubectl -n {{ include "devopsmate-agent.namespace" . }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
 
 Then open DevopsMate → Infrastructure to confirm your nodes/pods are reporting (usually within a few seconds).
+
+Uninstall:
+{{- if and .Values.uninstaller.enabled .Values.api.endpoint }}
+  One-click auto-uninstall is ENABLED. Click "Remove Agent" on any node of this
+  cluster in the DevopsMate Agent Fleet dashboard and the in-cluster uninstaller
+  will delete this release (namespace + cluster RBAC) within ~{{ .Values.uninstaller.pollIntervalSeconds }}s.
+  To uninstall manually instead:
+{{- else }}
+  Auto-uninstall is OFF (set api.endpoint to enable the in-cluster uninstaller).
+  Uninstall with Helm:
+{{- end }}
+  helm uninstall {{ .Release.Name }} -n {{ include "devopsmate-agent.namespace" . }} && kubectl delete namespace {{ include "devopsmate-agent.namespace" . }}

@@ -1,0 +1,55 @@
+{{- if and .Values.uninstaller.enabled .Values.api.endpoint -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "devopsmate-agent.fullname" . }}-uninstaller
+  namespace: {{ include "devopsmate-agent.namespace" . }}
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+    component: uninstaller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      component: uninstaller
+  template:
+    metadata:
+      labels:
+        {{- include "devopsmate-agent.labels" . | nindent 8 }}
+        component: uninstaller
+      annotations:
+        checksum/script: {{ include (print $.Template.BasePath "/configmap-uninstaller.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "devopsmate-agent.fullname" . }}-uninstaller
+      containers:
+        - name: uninstaller
+          image: "{{ .Values.uninstaller.image.repository }}:{{ .Values.uninstaller.image.tag }}"
+          imagePullPolicy: {{ .Values.uninstaller.image.pullPolicy }}
+          command: ["sh", "/scripts/poll.sh"]
+          env:
+            - name: API_ENDPOINT
+              value: {{ .Values.api.endpoint | quote }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.global.clusterName | quote }}
+            - name: NAMESPACE
+              value: {{ include "devopsmate-agent.namespace" . | quote }}
+            - name: AGENT_FULLNAME
+              value: {{ include "devopsmate-agent.fullname" . | quote }}
+            - name: POLL_INTERVAL
+              value: {{ .Values.uninstaller.pollIntervalSeconds | quote }}
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "devopsmate-agent.apiKeySecretName" . }}
+                  key: {{ include "devopsmate-agent.apiKeySecretKey" . }}
+          resources:
+            requests: { cpu: "10m", memory: "16Mi" }
+            limits:   { cpu: "50m", memory: "32Mi" }
+          volumeMounts:
+            - { name: script, mountPath: /scripts, readOnly: true }
+      volumes:
+        - name: script
+          configMap:
+            name: {{ include "devopsmate-agent.fullname" . }}-uninstaller
+{{- end }}

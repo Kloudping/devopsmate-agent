@@ -15,6 +15,13 @@ global:
   env: "production"         # OTEL_ENVIRONMENT — drives gateway routing
   clusterName: ""           # optional k8s.cluster.name attribute
 
+# DevopsMate REST API (NOT the OTLP gateway). Enables one-click auto-uninstall:
+# the in-cluster uninstaller pod polls this API and, when you click "Remove Agent"
+# in the dashboard, deletes this release (namespace + cluster RBAC) from inside the
+# cluster. Leave blank to disable the uninstaller (uninstall stays manual via Helm).
+api:
+  endpoint: ""              # e.g. https://api.devopsmate.io  (base URL, no trailing slash)
+
 gateway:
   endpoint: ""              # OTLP gRPC host:port of the DevopsMate gateway (required)
   tls:
@@ -76,6 +83,18 @@ beyla:
     # light nodes stay near the request.
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 500m, memory: 1Gi }
+
+# In-cluster uninstaller: a tiny pod that polls the DevopsMate API and, on a
+# Remove request from the dashboard, deletes this release from inside the cluster
+# (namespace + the agent's cluster-scoped RBAC) via the Kubernetes API. Only
+# rendered when api.endpoint is also set.
+uninstaller:
+  enabled: true
+  image:
+    repository: curlimages/curl
+    tag: "8.11.1"
+    pullPolicy: IfNotPresent
+  pollIntervalSeconds: 60
 
 serviceAccount:
   create: true

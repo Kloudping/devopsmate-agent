@@ -1,0 +1,23 @@
+{{- if and .Values.uninstaller.enabled .Values.api.endpoint .Values.rbac.create -}}
+{{- $full := include "devopsmate-agent.fullname" . -}}
+# Least-privilege teardown role for the uninstaller pod: it may delete ONLY this
+# release's namespace and this release's cluster-scoped RBAC objects (by name).
+# Separate from the collectors' read-only ClusterRole so the collector pods never
+# get delete permissions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $full }}-uninstaller
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+    component: uninstaller
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["{{ include "devopsmate-agent.namespace" . }}"]
+    verbs: ["get", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    resourceNames: ["{{ $full }}", "{{ $full }}-uninstaller"]
+    verbs: ["get", "delete"]
+{{- end }}

@@ -1,0 +1,53 @@
+{{- if and .Values.uninstaller.enabled .Values.api.endpoint -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "devopsmate-agent.fullname" . }}-uninstaller
+  namespace: {{ include "devopsmate-agent.namespace" . }}
+  labels:
+    {{- include "devopsmate-agent.labels" . | nindent 4 }}
+    component: uninstaller
+data:
+  poll.sh: |
+    #!/bin/sh
+    # In-cluster uninstaller. Polls the DevopsMate API for a teardown signal for
+    # this cluster and, when set, deletes the whole release from inside the cluster
+    # via the Kubernetes API (using the pod's ServiceAccount token). This is what
+    # makes the dashboard "Remove Agent" button uninstall a Kubernetes agent
+    # automatically — our backend has no credentials into your cluster, so the
+    # teardown has to run here.
+    set -u
+    API="${API_ENDPOINT%/}"
+    SA=/var/run/secrets/kubernetes.io/serviceaccount
+    APISERVER="https://kubernetes.default.svc"
+    RBAC="$APISERVER/apis/rbac.authorization.k8s.io/v1"
+
+    k8s_delete() {
+      # $1 = resource path under the API server
+      curl -sS -m 15 -X DELETE --cacert "$SA/ca.crt" \
+        -H "Authorization: Bearer $(cat $SA/token)" "$APISERVER$1" >/dev/null 2>&1 || true
+    }
+
+    echo "uninstaller: polling $API for cluster=$CLUSTER_NAME every ${POLL_INTERVAL}s"
+    while true; do
+      resp="$(curl -sS -m 10 -H "X-API-Key: $API_KEY" \
+        "$API/api/v1/agent/k8s/uninstall-status?cluster_name=$CLUSTER_NAME" 2>/dev/null || true)"
+      case "$resp" in
+        *'"uninstall":true'*|*'"uninstall": true'*)
+          echo "uninstaller: teardown signal received - deleting release $AGENT_FULLNAME"
+          # 1) Namespace: async cascade removes the collectors, the api-key Secret,
+          #    the Helm release storage Secret, this ConfigMap, and this pod itself.
+          k8s_delete "/api/v1/namespaces/$NAMESPACE"
+          # 2) Collector cluster-scoped RBAC (not in the namespace).
+          k8s_delete "/apis/rbac.authorization.k8s.io/v1/clusterroles/$AGENT_FULLNAME"
+          k8s_delete "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/$AGENT_FULLNAME"
+          # 3) Our own cluster RBAC LAST (role then binding = self-revoke).
+          k8s_delete "/apis/rbac.authorization.k8s.io/v1/clusterroles/${AGENT_FULLNAME}-uninstaller"
+          k8s_delete "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/${AGENT_FULLNAME}-uninstaller"
+          echo "uninstaller: delete calls issued; exiting"
+          exit 0
+          ;;
+      esac
+      sleep "$POLL_INTERVAL"
+    done
+{{- end }}
