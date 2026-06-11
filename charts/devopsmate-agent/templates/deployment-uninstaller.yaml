@@ -36,6 +36,11 @@ spec:
               value: {{ include "devopsmate-agent.namespace" . | quote }}
             - name: AGENT_FULLNAME
               value: {{ include "devopsmate-agent.fullname" . | quote }}
+            # Unix epoch of this install/upgrade. The backend ignores any uninstall
+            # request created before this, so a stale request can't tear down a
+            # freshly reinstalled agent.
+            - name: INSTALLED_AT
+              value: {{ now | unixEpoch | quote }}
             - name: POLL_INTERVAL
               value: {{ .Values.uninstaller.pollIntervalSeconds | quote }}
             - name: API_KEY

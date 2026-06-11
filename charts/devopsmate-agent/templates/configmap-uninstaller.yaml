@@ -31,7 +31,7 @@ data:
     echo "uninstaller: polling $API for cluster=$CLUSTER_NAME every ${POLL_INTERVAL}s"
     while true; do
       resp="$(curl -sS -m 10 -H "X-API-Key: $API_KEY" \
-        "$API/api/v1/agent/k8s/uninstall-status?cluster_name=$CLUSTER_NAME" 2>/dev/null || true)"
+        "$API/api/v1/agent/k8s/uninstall-status?cluster_name=$CLUSTER_NAME&installed_at=$INSTALLED_AT" 2>/dev/null || true)"
       case "$resp" in
         *'"uninstall":true'*|*'"uninstall": true'*)
           echo "uninstaller: teardown signal received - deleting release $AGENT_FULLNAME"
